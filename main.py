@@ -8,6 +8,13 @@ import face_recognition
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+
+def _env_flag(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 def configure_optional_cuda_dll_path():
     if os.name != "nt":
         return
@@ -33,13 +40,15 @@ def configure_optional_cuda_dll_path():
 
 
 def get_runtime_config():
+    require_cuda = _env_flag("REQUIRE_CUDA", default=True)
+
     config = {
         "gpu_available": False,
         "gpu_devices": 0,
-        "detection_model": "hog",
-        "enrollment_scale": 0.5,
-        "live_scale": 0.25,
-        "label": "CPU",
+        "detection_model": "cnn",
+        "enrollment_scale": 0.25,
+        "live_scale": 0.5,
+        "label": "GPU/CUDA (requested)",
     }
 
     try:
@@ -50,13 +59,28 @@ def get_runtime_config():
             config.update(
                 gpu_available=True,
                 gpu_devices=gpu_devices,
-                detection_model="cnn",
-                enrollment_scale=0.25,
-                live_scale=0.5,
                 label=f"GPU/CUDA ({gpu_devices} device(s))",
             )
+            return config
+
+        reason = "CUDA runtime not detected"
+        if not cuda_enabled_in_dlib:
+            reason = "dlib is not compiled with CUDA support"
+        elif gpu_devices == 0:
+            reason = "no CUDA GPU device found"
+
+        if require_cuda:
+            raise RuntimeError(
+                f"CNN/GPU mode was requested, but {reason}. "
+                "Set REQUIRE_CUDA=0 to allow CNN on CPU."
+            )
+
+        config.update(label="CPU (CNN fallback)")
+        print(f"[WARN] {reason}. Continuing with CNN on CPU.")
     except Exception as exc:
-        print(f"[WARN] CUDA probe failed: {exc}")
+        if require_cuda:
+            raise
+        print(f"[WARN] CUDA probe failed: {exc}. Continuing with CNN on CPU.")
 
     return config
 
@@ -122,16 +146,6 @@ def load_known_faces(runtime_config, known_faces_dir="known_faces"):
                 known_face_encodings.append(encodings[0])
                 known_face_names.append(person_name)
                 print(f"[ENCODED] {person_name} <- {display_path}")
-            elif detection_model != "hog":
-                print(f"[RETRY] {display_path}: trying HOG fallback...")
-                face_locations = face_recognition.face_locations(img, model="hog")
-                encodings = face_recognition.face_encodings(img, face_locations, model="large")
-                if encodings:
-                    known_face_encodings.append(encodings[0])
-                    known_face_names.append(person_name)
-                    print(f"[ENCODED] {person_name} (HOG fallback) <- {display_path}")
-                else:
-                    print(f"[SKIPPED] No usable face found in {display_path}")
             else:
                 print(f"[SKIPPED] No usable face found in {display_path}")
 

@@ -141,7 +141,8 @@ def decode_uploaded_image_to_bgr(uploaded_image):
 
 def validate_registration_image(frame_bgr):
     rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    face_locations = face_recognition.face_locations(rgb_frame, model="hog")
+    detection_model = runtime_config.get("detection_model", "cnn")
+    face_locations = face_recognition.face_locations(rgb_frame, model=detection_model)
 
     if len(face_locations) == 0:
         raise ValueError("No face detected. Upload a clear front-facing image.")
@@ -164,8 +165,8 @@ def save_registration_image(student_key, frame_bgr):
 
 
 def detect_known_faces(frame_bgr, tolerance=0.48):
-    detection_model = runtime_config.get("detection_model", "hog")
-    live_scale = runtime_config.get("live_scale", 0.25)
+    detection_model = runtime_config.get("detection_model", "cnn")
+    live_scale = runtime_config.get("live_scale", 0.5)
 
     small_frame = cv2.resize(frame_bgr, (0, 0), fx=live_scale, fy=live_scale)
     rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
@@ -237,7 +238,7 @@ def state_payload():
     return {
         "runtime": {
             "label": runtime_config.get("label", "CPU"),
-            "detection_model": runtime_config.get("detection_model", "hog"),
+            "detection_model": runtime_config.get("detection_model", "cnn"),
             "gpu_available": runtime_config.get("gpu_available", False),
             "gpu_devices": runtime_config.get("gpu_devices", 0),
         },
