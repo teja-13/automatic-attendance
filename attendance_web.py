@@ -7,24 +7,121 @@ import threading
 from datetime import datetime
 
 import cv2
-import face_recognition
 import numpy as np
 from flask import Flask, jsonify, render_template_string, request, send_file
-
-from main import configure_optional_cuda_dll_path, get_runtime_config, load_known_faces
 
 
 app = Flask(__name__)
 state_lock = threading.Lock()
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
 
 runtime_config = {}
 known_face_encodings = []
 known_face_names = []
 attendance_state = {}
 attendance_events = []
+system_initialized = False
+_face_recognition_module = None
 
 KNOWN_FACES_DIR = "known_faces"
 ALLOWED_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+
+def get_face_recognition():
+    global _face_recognition_module
+
+    if _face_recognition_module is None:
+        import face_recognition as face_recognition_module
+
+        _face_recognition_module = face_recognition_module
+
+    return _face_recognition_module
+
+
+def _safe_float_env(name, default, min_value=None, max_value=None):
+    raw = os.environ.get(name)
+
+    try:
+        value = float(raw) if raw is not None else float(default)
+    except (TypeError, ValueError):
+        value = float(default)
+
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+
+    return value
+
+
+def get_runtime_config():
+    requested_model = (os.environ.get("FACE_DETECTION_MODEL") or "hog").strip().lower()
+    detection_model = requested_model if requested_model in {"hog", "cnn"} else "hog"
+
+    return {
+        "gpu_available": False,
+        "gpu_devices": 0,
+        "detection_model": detection_model,
+        "enrollment_scale": _safe_float_env("ENROLLMENT_SCALE", 0.5, min_value=0.2, max_value=1.0),
+        "live_scale": _safe_float_env("LIVE_SCALE", 0.5, min_value=0.25, max_value=1.0),
+        "label": "CPU",
+    }
+
+
+def load_known_faces(runtime_settings, known_faces_dir=KNOWN_FACES_DIR):
+    known_encodings = []
+    known_names = []
+    image_extensions = (".jpg", ".jpeg", ".png")
+    detection_model = runtime_settings.get("detection_model", "hog")
+    enrollment_scale = runtime_settings.get("enrollment_scale", 0.5)
+    face_recognition = get_face_recognition()
+
+    if not os.path.exists(known_faces_dir):
+        os.makedirs(known_faces_dir, exist_ok=True)
+        return known_encodings, known_names
+
+    image_paths = []
+    for root, _, files in os.walk(known_faces_dir):
+        for filename in files:
+            if filename.lower().endswith(image_extensions):
+                image_paths.append(os.path.join(root, filename))
+
+    for image_path in sorted(image_paths):
+        relative_path = os.path.relpath(image_path, known_faces_dir)
+        path_parts = relative_path.split(os.sep)
+        if len(path_parts) > 1:
+            person_name = path_parts[0].replace("_", " ").title()
+        else:
+            person_name = os.path.splitext(path_parts[0])[0].replace("_", " ").title()
+
+        try:
+            image = face_recognition.load_image_file(image_path)
+
+            if enrollment_scale != 1.0:
+                small_image = cv2.resize(image, (0, 0), fx=enrollment_scale, fy=enrollment_scale)
+                scale_back = 1.0 / enrollment_scale
+                small_locations = face_recognition.face_locations(small_image, model=detection_model)
+                face_locations = [
+                    (int(t * scale_back), int(r * scale_back), int(b * scale_back), int(l * scale_back))
+                    for (t, r, b, l) in small_locations
+                ]
+            else:
+                face_locations = face_recognition.face_locations(image, model=detection_model)
+
+            if not face_locations:
+                continue
+
+            encodings = face_recognition.face_encodings(image, face_locations, model="small")
+            if not encodings:
+                continue
+
+            known_encodings.append(encodings[0])
+            known_names.append(person_name)
+        except Exception:
+            continue
+
+    return known_encodings, known_names
 
 
 def now_local_iso():
@@ -76,17 +173,21 @@ def sync_attendance_state_with_known_people():
             del attendance_state[name]
 
 
-def initialize_system():
+def ensure_system_initialized(force_reload=False):
     global runtime_config
     global known_face_encodings
     global known_face_names
     global attendance_events
+    global system_initialized
 
-    configure_optional_cuda_dll_path()
+    if system_initialized and not force_reload:
+        return
+
     runtime_config = get_runtime_config()
     known_face_encodings, known_face_names = load_known_faces(runtime_config, KNOWN_FACES_DIR)
     reset_attendance_state()
     attendance_events = []
+    system_initialized = True
 
 
 def decode_data_url_to_bgr(data_url):
@@ -141,7 +242,8 @@ def decode_uploaded_image_to_bgr(uploaded_image):
 
 def validate_registration_image(frame_bgr):
     rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    detection_model = runtime_config.get("detection_model", "cnn")
+    face_recognition = get_face_recognition()
+    detection_model = runtime_config.get("detection_model", "hog")
     face_locations = face_recognition.face_locations(rgb_frame, model=detection_model)
 
     if len(face_locations) == 0:
@@ -165,7 +267,8 @@ def save_registration_image(student_key, frame_bgr):
 
 
 def detect_known_faces(frame_bgr, tolerance=0.48):
-    detection_model = runtime_config.get("detection_model", "cnn")
+    face_recognition = get_face_recognition()
+    detection_model = runtime_config.get("detection_model", "hog")
     live_scale = runtime_config.get("live_scale", 0.5)
 
     small_frame = cv2.resize(frame_bgr, (0, 0), fx=live_scale, fy=live_scale)
@@ -235,28 +338,32 @@ def apply_attendance_rules(location, recognized_people):
 
 
 def state_payload():
-    return {
-        "runtime": {
-            "label": runtime_config.get("label", "CPU"),
-            "detection_model": runtime_config.get("detection_model", "cnn"),
-            "gpu_available": runtime_config.get("gpu_available", False),
-            "gpu_devices": runtime_config.get("gpu_devices", 0),
-        },
-        "known_people": sorted(set(known_face_names)),
-        "attendance": build_attendance_rows(),
-        "events": list(reversed(attendance_events[-30:])),
-    }
+  return {
+    "runtime": {
+      "label": runtime_config.get("label", "CPU"),
+      "detection_model": runtime_config.get("detection_model", "hog"),
+      "gpu_available": runtime_config.get("gpu_available", False),
+      "gpu_devices": runtime_config.get("gpu_devices", 0),
+    },
+    "known_people": sorted(set(known_face_names)),
+    "attendance": build_attendance_rows(),
+    "events": list(reversed(attendance_events[-30:])),
+  }
 
 
 @app.get("/")
 def index():
-    payload = state_payload()
+    with state_lock:
+        ensure_system_initialized()
+        payload = state_payload()
+
     return render_template_string(HTML_TEMPLATE, initial_payload=payload)
 
 
 @app.get("/api/state")
 def api_state():
     with state_lock:
+        ensure_system_initialized()
         return jsonify(state_payload())
 
 
@@ -271,11 +378,12 @@ def api_process():
 
     try:
         frame = decode_data_url_to_bgr(image_data)
-        recognized_people, unknown_count = detect_known_faces(frame)
     except Exception as exc:
         return jsonify({"error": f"Could not process image: {exc}"}), 400
 
     with state_lock:
+        ensure_system_initialized()
+        recognized_people, unknown_count = detect_known_faces(frame)
         apply_attendance_rules(location, recognized_people)
         payload = state_payload()
 
@@ -288,6 +396,7 @@ def api_process():
 @app.post("/api/clear")
 def api_clear():
     with state_lock:
+        ensure_system_initialized()
         reset_attendance_state()
         attendance_events.clear()
         return jsonify(state_payload())
@@ -295,13 +404,8 @@ def api_clear():
 
 @app.post("/api/reload")
 def api_reload():
-    global known_face_encodings
-    global known_face_names
-
     with state_lock:
-        known_face_encodings, known_face_names = load_known_faces(runtime_config, KNOWN_FACES_DIR)
-        reset_attendance_state()
-        attendance_events.clear()
+        ensure_system_initialized(force_reload=True)
         return jsonify(state_payload())
 
 
@@ -312,6 +416,9 @@ def api_register():
 
     student_name_raw = request.form.get("student_name", "")
     uploaded_image = request.files.get("image")
+
+    with state_lock:
+        ensure_system_initialized()
 
     try:
         student_name, student_key = normalize_student_name(student_name_raw)
@@ -338,11 +445,15 @@ def api_register():
 
 @app.get("/api/export")
 def api_export():
+    with state_lock:
+        ensure_system_initialized()
+        rows = build_attendance_rows()
+
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Name", "Status", "Last Seen", "Last Location", "Confidence"])
 
-    for row in build_attendance_rows():
+    for row in rows:
         writer.writerow(
             [
                 row["name"],
@@ -1081,8 +1192,6 @@ HTML_TEMPLATE = """
 """
 
 
-initialize_system()
-
-
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)

@@ -41,60 +41,30 @@ Known-face dataset format supported:
 
 ## Local Setup
 
-### 1. Create and activate virtual environment
-
-Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-### 2. Install dependencies
+### 1. Install dependencies
 
 ```powershell
 python -m pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-Install `face-recognition` package explicitly (required because imports use `face_recognition`):
-
-Windows:
-
-```powershell
-pip install dlib-bin==19.24.6
-pip install face-recognition==1.3.0 --no-deps
-pip install face-recognition-models==0.3.0
-```
-
-Linux/macOS (if needed):
-
-```bash
-pip install dlib==19.24.2
-pip install face-recognition==1.3.0 --no-deps
-pip install face-recognition-models==0.3.0
-```
-
 ## Runtime Mode (CUDA vs CPU)
 
-By default, the app expects CUDA (`REQUIRE_CUDA=1`). On most local systems and on Render, use CPU fallback:
+The web app is CPU-safe by default and does not require CUDA.
+
+Optional runtime tuning:
 
 Windows PowerShell:
 
 ```powershell
-$env:REQUIRE_CUDA="0"
+$env:FACE_DETECTION_MODEL="hog"
 ```
 
 CMD:
 
 ```cmd
-set REQUIRE_CUDA=0
+set FACE_DETECTION_MODEL=hog
 ```
-
-Optional CUDA DLL path settings on Windows (only if you actually use CUDA):
-
-- `CUDA_DLL_DIR`
-- `CUDA_PATH`
 
 ## Run The Web Dashboard
 
@@ -137,16 +107,17 @@ This repo already includes `render.yaml` for a Python web service with `gunicorn
 
 Important for Render:
 
-1. Set environment variable `REQUIRE_CUDA=0` (Render instances are CPU).
-2. Deploy from repository root.
-3. Render uses `buildCommand` and `startCommand` from `render.yaml`.
+1. Use `runtime.txt` (`python-3.11.8`) to pin Python to a supported version.
+2. `Procfile` uses `web: gunicorn attendance_web:app`.
+3. `render.yaml` handles build/install and binds with `--bind 0.0.0.0:$PORT`.
+4. Render uses CPU mode (`FACE_DETECTION_MODEL=hog`) and low thread env settings.
 
 ## Troubleshooting
 
 - Error about CUDA/CNN required:
-  - Set `REQUIRE_CUDA=0` before running.
+  - Use `FACE_DETECTION_MODEL=hog`.
 - `ModuleNotFoundError: face_recognition`:
-  - Run the explicit install commands for `face-recognition` shown above.
+  - Re-run `pip install -r requirements.txt`.
 - No known faces found:
   - Add images under `known_faces/<person_name>/` and reload.
 - Registration fails:
