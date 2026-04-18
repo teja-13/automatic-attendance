@@ -1,6 +1,8 @@
 import base64
 import csv
 import io
+import os
+import re
 import threading
 from datetime import datetime
 
@@ -20,6 +22,9 @@ known_face_encodings = []
 known_face_names = []
 attendance_state = {}
 attendance_events = []
+
+KNOWN_FACES_DIR = "known_faces"
+ALLOWED_UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 
 def now_local_iso():
@@ -42,17 +47,33 @@ def build_attendance_rows():
     return rows
 
 
+def make_absent_attendance_record():
+    return {
+        "status": "Absent",
+        "last_seen": "-",
+        "last_location": "-",
+        "confidence": 0.0,
+    }
+
+
 def reset_attendance_state():
     global attendance_state
     attendance_state = {
-        name: {
-            "status": "Absent",
-            "last_seen": "-",
-            "last_location": "-",
-            "confidence": 0.0,
-        }
+        name: make_absent_attendance_record()
         for name in sorted(set(known_face_names))
     }
+
+
+def sync_attendance_state_with_known_people():
+    known_people = sorted(set(known_face_names))
+
+    for name in known_people:
+        if name not in attendance_state:
+            attendance_state[name] = make_absent_attendance_record()
+
+    for name in list(attendance_state.keys()):
+        if name not in known_people:
+            del attendance_state[name]
 
 
 def initialize_system():
@@ -63,7 +84,7 @@ def initialize_system():
 
     configure_optional_cuda_dll_path()
     runtime_config = get_runtime_config()
-    known_face_encodings, known_face_names = load_known_faces(runtime_config, "known_faces")
+    known_face_encodings, known_face_names = load_known_faces(runtime_config, KNOWN_FACES_DIR)
     reset_attendance_state()
     attendance_events = []
 
@@ -81,6 +102,65 @@ def decode_data_url_to_bgr(data_url):
         raise ValueError("Image decode failed")
 
     return frame
+
+
+def normalize_student_name(student_name):
+    cleaned = re.sub(r"\s+", " ", (student_name or "")).strip()
+    if not cleaned:
+        raise ValueError("Student name is required.")
+
+    student_key = cleaned.lower().replace(" ", "_")
+    student_key = re.sub(r"[^a-z0-9_-]", "", student_key)
+    student_key = re.sub(r"_+", "_", student_key).strip("_")
+
+    if not student_key:
+        raise ValueError("Student name must include letters or numbers.")
+
+    return cleaned, student_key
+
+
+def decode_uploaded_image_to_bgr(uploaded_image):
+    if uploaded_image is None or uploaded_image.filename == "":
+        raise ValueError("Please upload an image file.")
+
+    extension = os.path.splitext(uploaded_image.filename)[1].lower()
+    if extension not in ALLOWED_UPLOAD_EXTENSIONS:
+        raise ValueError("Only JPG and PNG images are supported.")
+
+    image_bytes = uploaded_image.read()
+    if not image_bytes:
+        raise ValueError("Uploaded image is empty.")
+
+    image_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Could not decode uploaded image.")
+
+    return frame
+
+
+def validate_registration_image(frame_bgr):
+    rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    face_locations = face_recognition.face_locations(rgb_frame, model="hog")
+
+    if len(face_locations) == 0:
+        raise ValueError("No face detected. Upload a clear front-facing image.")
+
+    if len(face_locations) > 1:
+        raise ValueError("Multiple faces detected. Upload an image with one face only.")
+
+
+def save_registration_image(student_key, frame_bgr):
+    student_dir = os.path.join(KNOWN_FACES_DIR, student_key)
+    os.makedirs(student_dir, exist_ok=True)
+
+    filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+    file_path = os.path.join(student_dir, filename)
+
+    if not cv2.imwrite(file_path, frame_bgr):
+        raise ValueError("Could not save the uploaded image.")
+
+    return os.path.relpath(file_path, KNOWN_FACES_DIR)
 
 
 def detect_known_faces(frame_bgr, tolerance=0.48):
@@ -132,12 +212,7 @@ def apply_attendance_rules(location, recognized_people):
         confidence = person["confidence"]
 
         if name not in attendance_state:
-            attendance_state[name] = {
-                "status": "Absent",
-                "last_seen": "-",
-                "last_location": "-",
-                "confidence": 0.0,
-            }
+            attendance_state[name] = make_absent_attendance_record()
 
         attendance_state[name]["status"] = status
         attendance_state[name]["last_seen"] = timestamp
@@ -223,10 +298,41 @@ def api_reload():
     global known_face_names
 
     with state_lock:
-        known_face_encodings, known_face_names = load_known_faces(runtime_config, "known_faces")
+        known_face_encodings, known_face_names = load_known_faces(runtime_config, KNOWN_FACES_DIR)
         reset_attendance_state()
         attendance_events.clear()
         return jsonify(state_payload())
+
+
+@app.post("/api/register")
+def api_register():
+    global known_face_encodings
+    global known_face_names
+
+    student_name_raw = request.form.get("student_name", "")
+    uploaded_image = request.files.get("image")
+
+    try:
+        student_name, student_key = normalize_student_name(student_name_raw)
+        frame_bgr = decode_uploaded_image_to_bgr(uploaded_image)
+        validate_registration_image(frame_bgr)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    with state_lock:
+        try:
+            saved_image = save_registration_image(student_key, frame_bgr)
+            known_face_encodings, known_face_names = load_known_faces(runtime_config, KNOWN_FACES_DIR)
+            sync_attendance_state_with_known_people()
+            payload = state_payload()
+        except Exception as exc:
+            return jsonify({"error": f"Registration failed: {exc}"}), 500
+
+    payload["registration"] = {
+        "name": student_name.title(),
+        "image": saved_image.replace("\\", "/"),
+    }
+    return jsonify(payload), 201
 
 
 @app.get("/api/export")
@@ -409,6 +515,18 @@ HTML_TEMPLATE = """
     .btn-danger { background: var(--danger); color: white; }
     .btn-neutral { background: #edf3f0; color: #193630; }
 
+    .splitter {
+      border: 0;
+      border-top: 1px solid #e3ece8;
+      margin: 16px 0 14px;
+    }
+
+    .subheading {
+      margin: 0 0 8px;
+      font-size: 1rem;
+      color: #264740;
+    }
+
     .auto-row {
       margin-top: 10px;
       padding: 10px;
@@ -423,12 +541,35 @@ HTML_TEMPLATE = """
     }
 
     select,
+    input[type="text"],
+    input[type="file"],
     input[type="number"] {
       border: 1px solid #b9ccc5;
       border-radius: 8px;
       padding: 6px 8px;
       background: white;
       color: var(--ink);
+    }
+
+    .registration-form {
+      display: grid;
+      gap: 10px;
+    }
+
+    .form-row {
+      display: grid;
+      gap: 6px;
+    }
+
+    .form-row label {
+      font-size: 0.87rem;
+      color: var(--muted);
+      font-weight: 600;
+    }
+
+    .form-hint {
+      font-size: 0.82rem;
+      color: #4f6e66;
     }
 
     .recognition-list {
@@ -575,6 +716,37 @@ HTML_TEMPLATE = """
           <button class="btn-neutral" id="clearSessionBtn" type="button">Clear Session</button>
           <a class="link-btn btn-neutral" href="/api/export" target="_blank" rel="noopener">Export CSV</a>
         </div>
+
+        <hr class="splitter" />
+        <h3 class="subheading">Student Registration</h3>
+        <form class="registration-form" id="registrationForm" enctype="multipart/form-data">
+          <div class="form-row">
+            <label for="studentNameInput">Student Name</label>
+            <input
+              id="studentNameInput"
+              name="student_name"
+              type="text"
+              placeholder="Enter full name"
+              maxlength="80"
+              required
+            />
+          </div>
+
+          <div class="form-row">
+            <label for="studentImageInput">Face Image (JPG/PNG)</label>
+            <input
+              id="studentImageInput"
+              name="image"
+              type="file"
+              accept=".jpg,.jpeg,.png,image/jpeg,image/png"
+              required
+            />
+            <div class="form-hint">Upload one clear face image with only one person in frame.</div>
+          </div>
+
+          <button class="btn-primary" id="registerBtn" type="submit">Register Student</button>
+        </form>
+        <p class="notice" id="registrationNotice"></p>
       </article>
     </section>
 
@@ -617,12 +789,22 @@ HTML_TEMPLATE = """
     const autoMode = document.getElementById("autoMode");
     const intervalSeconds = document.getElementById("intervalSeconds");
     const autoLocation = document.getElementById("autoLocation");
+    const registrationForm = document.getElementById("registrationForm");
+    const studentNameInput = document.getElementById("studentNameInput");
+    const studentImageInput = document.getElementById("studentImageInput");
+    const registerBtn = document.getElementById("registerBtn");
+    const registrationNotice = document.getElementById("registrationNotice");
 
     let mediaStream = null;
     let autoTimer = null;
 
     function setNotice(message) {
       captureNotice.textContent = message;
+    }
+
+    function setRegistrationNotice(message, isError = false) {
+      registrationNotice.textContent = message;
+      registrationNotice.style.color = isError ? "#af2e22" : "#2f6157";
     }
 
     function runtimeBadge(label, className) {
@@ -830,12 +1012,60 @@ HTML_TEMPLATE = """
       setNotice("Known faces reloaded.");
     }
 
+    async function registerStudent(event) {
+      event.preventDefault();
+
+      const studentName = studentNameInput.value.trim();
+      const imageFile = studentImageInput.files && studentImageInput.files[0];
+
+      if (!studentName) {
+        setRegistrationNotice("Please enter the student name.", true);
+        return;
+      }
+
+      if (!imageFile) {
+        setRegistrationNotice("Please choose an image file.", true);
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("student_name", studentName);
+      formData.append("image", imageFile);
+
+      registerBtn.disabled = true;
+      setRegistrationNotice("Registering student...");
+
+      try {
+        const response = await fetch("/api/register", {
+          method: "POST",
+          body: formData,
+        });
+
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || "Could not register student.");
+        }
+
+        renderAll(payload);
+        renderRecognition([], 0, "-");
+        registrationForm.reset();
+
+        const name = payload.registration && payload.registration.name ? payload.registration.name : studentName;
+        setRegistrationNotice(`Registered ${name} successfully.`);
+      } catch (error) {
+        setRegistrationNotice(`Registration failed: ${error.message}`, true);
+      } finally {
+        registerBtn.disabled = false;
+      }
+    }
+
     document.getElementById("startCameraBtn").addEventListener("click", startCamera);
     document.getElementById("stopCameraBtn").addEventListener("click", stopCamera);
     document.getElementById("captureClassBtn").addEventListener("click", () => captureAndSend("classroom"));
     document.getElementById("captureElseBtn").addEventListener("click", () => captureAndSend("elsewhere"));
     document.getElementById("clearSessionBtn").addEventListener("click", clearSession);
     document.getElementById("reloadFacesBtn").addEventListener("click", reloadKnownFaces);
+    registrationForm.addEventListener("submit", registerStudent);
 
     autoMode.addEventListener("change", applyAutoMode);
     intervalSeconds.addEventListener("change", applyAutoMode);
@@ -843,6 +1073,7 @@ HTML_TEMPLATE = """
 
     renderAll(initialPayload);
     renderRecognition([], 0, "-");
+    setRegistrationNotice("Register a student to add their face to known faces.");
   </script>
 </body>
 </html>
