@@ -5,7 +5,7 @@ services:
     plan: starter
     buildCommand: |
       pip install --upgrade pip setuptools wheel
-      pip install "cmake>=3.29.0"
+      pip install "cmake>=3.25.0,<4.0"
       export CMAKE_BUILD_PARALLEL_LEVEL=1
       export MAX_JOBS=1
       pip install -r requirements.txt

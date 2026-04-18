@@ -108,9 +108,10 @@ This repo already includes `render.yaml` for a Python web service with `gunicorn
 Important for Render:
 
 1. Use `runtime.txt` (`python-3.11.8`) to pin Python to a supported version.
-2. `Procfile` uses `web: gunicorn attendance_web:app`.
-3. `render.yaml` handles build/install and binds with `--bind 0.0.0.0:$PORT`.
-4. Render uses CPU mode (`FACE_DETECTION_MODEL=hog`) and low thread env settings.
+2. `.python-version` is also set to `3.11.8` as a fallback pin.
+3. `Procfile` uses `web: gunicorn attendance_web:app`.
+4. `render.yaml` handles build/install and binds with `--bind 0.0.0.0:$PORT`.
+5. Render uses CPU mode (`FACE_DETECTION_MODEL=hog`) and low thread env settings.
 
 ## Troubleshooting
 
@@ -118,6 +119,10 @@ Important for Render:
   - Use `FACE_DETECTION_MODEL=hog`.
 - `ModuleNotFoundError: face_recognition`:
   - Re-run `pip install -r requirements.txt`.
+- Render uses Python 3.14.x by default:
+  - Ensure latest commit is deployed and set Python version to `3.11.8` in Render service settings (or redeploy with Blueprint from `render.yaml`).
+- dlib build fails with CMake policy errors:
+  - Keep CMake below 4.0 (`cmake>=3.25,<4.0`) for dlib compatibility.
 - No known faces found:
   - Add images under `known_faces/<person_name>/` and reload.
 - Registration fails:
