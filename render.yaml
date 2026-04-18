@@ -17,6 +17,10 @@ services:
         value: hog
       - key: REQUIRE_CUDA
         value: "0"
+      - key: CMAKE_BUILD_PARALLEL_LEVEL
+        value: "1"
+      - key: MAX_JOBS
+        value: "1"
       - key: OMP_NUM_THREADS
         value: "1"
       - key: OPENBLAS_NUM_THREADS
